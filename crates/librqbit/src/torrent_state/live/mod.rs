@@ -209,7 +209,7 @@ pub struct TorrentStateLive {
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
         ChunkInfo,
     )>,
-    ratelimits: Limits,
+    ratelimits: Arc<Limits>,
 
     /// BEP-19: WebSeed manager for HTTP seeding.
     webseed_manager: Option<Arc<crate::webseed::WebSeedManager>>,
@@ -260,7 +260,7 @@ impl TorrentStateLive {
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>();
-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
+        let ratelimits = Arc::new(Limits::new(paused.shared.options.ratelimits));
 
         // Initialize WebSeed manager if there are webseed URLs
         let webseed_manager = if !paused.metadata.webseed_urls.is_empty() {
@@ -277,7 +277,6 @@ impl TorrentStateLive {
                     Id20::new(arr)
                 })
                 .collect();
-
             let file_infos: Vec<crate::webseed::WebSeedFileInfo> = paused
                 .metadata
                 .file_infos
@@ -301,6 +300,23 @@ impl TorrentStateLive {
                 session_stats_for_callback.counters.fetched_bytes.fetch_add(bytes, Ordering::Relaxed);
             });
 
+            // Create rate limiter callback that applies both torrent and session limits
+            let torrent_ratelimits = ratelimits.clone();
+            let session_weak = Arc::downgrade(&session);
+            let rate_limiter: crate::webseed::RateLimitCallback = Arc::new(move |len| {
+                let torrent_ratelimits = torrent_ratelimits.clone();
+                let session_weak = session_weak.clone();
+                Box::pin(async move {
+                    // Apply torrent-level rate limit
+                    torrent_ratelimits.prepare_for_download(len).await?;
+                    // Apply session-level rate limit
+                    if let Some(session) = session_weak.upgrade() {
+                        session.ratelimits.prepare_for_download(len).await?;
+                    }
+                    Ok(())
+                })
+            });
+
             Some(Arc::new(crate::webseed::WebSeedManager::new(
                 paused.metadata.webseed_urls.clone(),
                 session.reqwest_client.clone(),
@@ -312,6 +328,7 @@ impl TorrentStateLive {
                 session.webseed_config.clone(),
                 cancellation_token.clone(),
                 Some(on_bytes_received),
+                Some(rate_limiter),
             )))
         } else {
             None

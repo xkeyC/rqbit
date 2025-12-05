@@ -19,7 +19,7 @@ use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
 use super::client::WebSeedClient;
-use super::{BytesReceivedCallback, WebSeedConfig, WebSeedDownloadResult, WebSeedError, WebSeedFileInfo, WebSeedUrl};
+use super::{BytesReceivedCallback, RateLimitCallback, WebSeedConfig, WebSeedDownloadResult, WebSeedError, WebSeedFileInfo, WebSeedUrl};
 
 /// Manages WebSeed downloads for a torrent.
 pub struct WebSeedManager {
@@ -47,6 +47,8 @@ pub struct WebSeedManager {
     in_flight: RwLock<HashSet<ValidPieceIndex>>,
     /// Callback for reporting bytes received during download.
     on_bytes_received: Option<BytesReceivedCallback>,
+    /// Callback for rate limiting downloads.
+    rate_limiter: Option<RateLimitCallback>,
 }
 
 impl WebSeedManager {
@@ -62,6 +64,7 @@ impl WebSeedManager {
         config: WebSeedConfig,
         cancel_token: CancellationToken,
         on_bytes_received: Option<BytesReceivedCallback>,
+        rate_limiter: Option<RateLimitCallback>,
     ) -> Self {
         let webseed_urls: Vec<WebSeedUrl> = webseeds.into_iter().map(WebSeedUrl::new).collect();
         let webseed_count = webseed_urls.len();
@@ -93,6 +96,7 @@ impl WebSeedManager {
             cancel_token,
             in_flight: RwLock::new(HashSet::new()),
             on_bytes_received,
+            rate_limiter,
         }
     }
 
@@ -253,6 +257,7 @@ impl WebSeedManager {
                 &self.file_infos,
                 self.is_multi_file,
                 self.on_bytes_received.as_ref(),
+                self.rate_limiter.as_ref(),
             )
             .await
     }
