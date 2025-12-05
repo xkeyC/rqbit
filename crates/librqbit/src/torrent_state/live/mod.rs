@@ -723,7 +723,10 @@ impl TorrentStateLive {
             chunks.mark_piece_downloaded(piece_index);
         }
 
-        // Update stats
+        // Update stats - include fetched_bytes for speed calculation
+        self.stats
+            .fetched_bytes
+            .fetch_add(piece_len, Ordering::Relaxed);
         self.stats
             .downloaded_and_checked_bytes
             .fetch_add(piece_len, Ordering::Release);
@@ -731,6 +734,12 @@ impl TorrentStateLive {
             .downloaded_and_checked_pieces
             .fetch_add(1, Ordering::Relaxed);
         self.stats.have_bytes.fetch_add(piece_len, Ordering::Relaxed);
+
+        // Update session-level stats for global speed calculation
+        self.session_stats
+            .counters
+            .fetched_bytes
+            .fetch_add(piece_len, Ordering::Relaxed);
 
         // Notify other components
         self.transmit_haves(piece_index);
