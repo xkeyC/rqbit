@@ -109,7 +109,7 @@ pub(crate) struct ManagedTorrentLocked {
 }
 
 #[derive(Default)]
-pub(crate) struct ManagedTorrentOptions {
+pub struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
@@ -190,7 +190,7 @@ pub struct ManagedTorrentShared {
     pub trackers: HashSet<url::Url>,
     pub peer_id: Id20,
     pub span: tracing::Span,
-    pub(crate) options: ManagedTorrentOptions,
+    pub options: ManagedTorrentOptions,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,

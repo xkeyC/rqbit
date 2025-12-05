@@ -1592,10 +1592,6 @@ impl Session {
         self.announce_port
     }
 
-    pub fn output_folder(&self) -> &PathBuf {
-        &self.output_folder
-    }
-
     async fn resolve_magnet(
         self: &Arc<Self>,
         info_hash: Id20,
