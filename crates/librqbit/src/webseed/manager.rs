@@ -50,8 +50,8 @@ pub struct AdaptiveConcurrencyController {
 
 impl AdaptiveConcurrencyController {
     pub fn new(max_concurrency: usize, increase_threshold: u32, decrease_threshold: u32, disable_threshold: u32) -> Self {
-        // Start with concurrency of 1
-        let initial = 1;
+        // Start with half of the target concurrency (at least 1)
+        let initial = (max_concurrency / 2).max(1);
         Self {
             current_concurrency: AtomicUsize::new(initial),
             max_concurrency,
@@ -161,12 +161,14 @@ impl AdaptiveConcurrencyController {
     pub fn reset(&self) {
         self.consecutive_successes.store(0, Ordering::Relaxed);
         self.consecutive_errors.store(0, Ordering::Relaxed);
-        // Reset concurrency to 1
-        let current = self.current_concurrency.swap(1, Ordering::SeqCst);
-        if current > 1 {
+        // Reset concurrency to half of max (at least 1)
+        let initial = (self.max_concurrency / 2).max(1);
+        let current = self.current_concurrency.swap(initial, Ordering::SeqCst);
+        if current != initial {
             debug!(
                 old = current,
-                "webseed adaptive concurrency reset to 1"
+                new = initial,
+                "webseed adaptive concurrency reset"
             );
         }
     }
@@ -229,10 +231,12 @@ impl WebSeedManager {
             .min(webseed_count.saturating_mul(config.max_concurrent_per_source));
 
         let adaptive_controller = if config.adaptive_concurrency {
+            let initial_concurrency = (effective_concurrency / 2).max(1);
             info!(
                 count = webseed_count,
                 max_concurrency = effective_concurrency,
-                "initialized webseed manager with adaptive concurrency (starting at 1)",
+                initial_concurrency = initial_concurrency,
+                "initialized webseed manager with adaptive concurrency (starting at half of max)",
             );
             Some(AdaptiveConcurrencyController::new(
                 effective_concurrency.max(1),
