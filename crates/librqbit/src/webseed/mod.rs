@@ -151,8 +151,8 @@ impl Default for WebSeedConfig {
             request_timeout_secs: 30,
             prefer_for_large_gaps: true,
             min_gap_for_webseed: 10,
-            max_errors_before_disable: 5,
-            disable_cooldown_secs: 300,
+            max_errors_before_disable: 10,
+            disable_cooldown_secs: 1800,
         }
     }
 }
