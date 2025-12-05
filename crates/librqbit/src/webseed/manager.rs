@@ -32,6 +32,8 @@ use super::{BytesReceivedCallback, RateLimitCallback, WebSeedConfig, WebSeedDown
 pub struct AdaptiveConcurrencyController {
     /// Current effective concurrency limit
     current_concurrency: AtomicUsize,
+    /// Currently active downloads
+    active_downloads: AtomicUsize,
     /// Maximum allowed concurrency
     max_concurrency: usize,
     /// Consecutive successes counter
@@ -44,23 +46,22 @@ pub struct AdaptiveConcurrencyController {
     decrease_threshold: u32,
     /// Errors at concurrency=1 before disabling
     disable_threshold: u32,
-    /// Semaphore for actual concurrency control
-    semaphore: Semaphore,
 }
 
 impl AdaptiveConcurrencyController {
     pub fn new(max_concurrency: usize, increase_threshold: u32, decrease_threshold: u32, disable_threshold: u32) -> Self {
         // Start with half of the target concurrency (at least 1)
         let initial = (max_concurrency / 2).max(1);
+        // Initialization - no print. We only log when concurrency actually changes.
         Self {
             current_concurrency: AtomicUsize::new(initial),
+            active_downloads: AtomicUsize::new(0),
             max_concurrency,
             consecutive_successes: AtomicU32::new(0),
             consecutive_errors: AtomicU32::new(0),
             increase_threshold,
             decrease_threshold,
             disable_threshold,
-            semaphore: Semaphore::new(initial),
         }
     }
     
@@ -69,14 +70,36 @@ impl AdaptiveConcurrencyController {
         self.current_concurrency.load(Ordering::Relaxed)
     }
     
-    /// Acquire a permit to perform a download
-    pub async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, WebSeedError> {
-        self.semaphore.acquire().await.map_err(|_| {
-            WebSeedError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "semaphore closed",
-            ))
-        })
+    /// Get number of active downloads
+    pub fn active(&self) -> usize {
+        self.active_downloads.load(Ordering::Relaxed)
+    }
+    
+    /// Try to acquire a slot for download. Returns true if acquired.
+    pub fn try_acquire(&self) -> bool {
+        loop {
+            let active = self.active_downloads.load(Ordering::Relaxed);
+            let limit = self.current_concurrency.load(Ordering::Relaxed);
+            
+            if active >= limit {
+                return false;
+            }
+            
+            if self.active_downloads.compare_exchange(
+                active,
+                active + 1,
+                Ordering::SeqCst,
+                Ordering::Relaxed
+            ).is_ok() {
+                return true;
+            }
+            // CAS failed, retry
+        }
+    }
+    
+    /// Release a download slot
+    pub fn release(&self) {
+        self.active_downloads.fetch_sub(1, Ordering::SeqCst);
     }
     
     /// Record a successful download
@@ -97,14 +120,9 @@ impl AdaptiveConcurrencyController {
                 Ordering::SeqCst, 
                 Ordering::Relaxed
             ).is_ok() {
-                // Successfully increased, add permit
-                self.semaphore.add_permits(1);
                 self.consecutive_successes.store(0, Ordering::Relaxed);
-                debug!(
-                    old = current,
-                    new = new_concurrency,
-                    "webseed adaptive concurrency increased"
-                );
+                println!("[webseed] Adaptive concurrency INCREASED: {} -> {} (after {} consecutive successes)", 
+                    current, new_concurrency, self.increase_threshold);
                 return true;
             }
         }
@@ -122,6 +140,7 @@ impl AdaptiveConcurrencyController {
         
         // Check if we should disable (at concurrency=1 with too many errors)
         if current == 1 && errors >= self.disable_threshold {
+            println!("[webseed] Adaptive concurrency: DISABLE triggered (errors={} at concurrency=1)", errors);
             return (false, true);
         }
         
@@ -129,35 +148,24 @@ impl AdaptiveConcurrencyController {
         if errors >= self.decrease_threshold && current > 1 {
             // Halve the concurrency (multiplicative decrease)
             let new_concurrency = (current / 2).max(1);
-            let decrease_amount = current - new_concurrency;
             
-            if decrease_amount > 0 {
-                if self.current_concurrency.compare_exchange(
-                    current,
-                    new_concurrency,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed
-                ).is_ok() {
-                    // We can't actually remove permits from a Semaphore,
-                    // but we can track the logical limit. The semaphore will
-                    // naturally drain as permits are acquired and not released.
-                    // For immediate effect, we'd need a different approach.
-                    // Here we'll just log and the reduction takes effect over time.
-                    self.consecutive_errors.store(0, Ordering::Relaxed);
-                    debug!(
-                        old = current,
-                        new = new_concurrency,
-                        "webseed adaptive concurrency decreased"
-                    );
-                    return (true, false);
-                }
+            if self.current_concurrency.compare_exchange(
+                current,
+                new_concurrency,
+                Ordering::SeqCst,
+                Ordering::Relaxed
+            ).is_ok() {
+                self.consecutive_errors.store(0, Ordering::Relaxed);
+                println!("[webseed] Adaptive concurrency DECREASED: {} -> {} (after {} consecutive errors)", 
+                    current, new_concurrency, self.decrease_threshold);
+                return (true, false);
             }
         }
         
         (false, false)
     }
     
-    /// Reset the controller state (but not the semaphore)
+    /// Reset the controller state
     pub fn reset(&self) {
         self.consecutive_successes.store(0, Ordering::Relaxed);
         self.consecutive_errors.store(0, Ordering::Relaxed);
@@ -165,11 +173,7 @@ impl AdaptiveConcurrencyController {
         let initial = (self.max_concurrency / 2).max(1);
         let current = self.current_concurrency.swap(initial, Ordering::SeqCst);
         if current != initial {
-            debug!(
-                old = current,
-                new = initial,
-                "webseed adaptive concurrency reset"
-            );
+            println!("[webseed] Adaptive concurrency RESET: {} -> {}", current, initial);
         }
     }
 }
@@ -326,18 +330,50 @@ impl WebSeedManager {
         &self,
         piece_index: ValidPieceIndex,
     ) -> Result<WebSeedDownloadResult, WebSeedError> {
-        // Acquire permit based on concurrency mode
-        // We need to hold the permit for the duration of the download
-        // The permit is held by _permit and released when it goes out of scope
-        let _permit: tokio::sync::SemaphorePermit<'_> = if let Some(ref controller) = self.adaptive_controller {
-            controller.acquire().await?
+        // For adaptive concurrency, we need to wait until we can acquire a slot
+        // For fixed concurrency, we use the semaphore
+        struct AdaptiveGuard<'a> {
+            controller: Option<&'a AdaptiveConcurrencyController>,
+        }
+        
+        impl Drop for AdaptiveGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(controller) = self.controller {
+                    controller.release();
+                }
+            }
+        }
+
+        let _guard: AdaptiveGuard<'_>;
+        let _permit: Option<tokio::sync::SemaphorePermit<'_>>;
+        
+        if let Some(ref controller) = self.adaptive_controller {
+            // Wait for a slot with polling (simple approach)
+            loop {
+                if self.cancel_token.is_cancelled() {
+                    return Err(WebSeedError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled",
+                    )));
+                }
+                
+                if controller.try_acquire() {
+                    break;
+                }
+                
+                // Wait a bit before retrying
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            _guard = AdaptiveGuard { controller: Some(controller) };
+            _permit = None;
         } else {
-            self.semaphore.acquire().await.map_err(|_| {
+            _guard = AdaptiveGuard { controller: None };
+            _permit = Some(self.semaphore.acquire().await.map_err(|_| {
                 WebSeedError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "semaphore closed",
                 ))
-            })?
+            })?);
         };
 
         if self.cancel_token.is_cancelled() {
@@ -516,6 +552,16 @@ impl WebSeedManager {
             controller.current()
         } else {
             self.semaphore.available_permits()
+        }
+    }
+
+    /// Get the number of active downloads.
+    pub fn active_downloads(&self) -> usize {
+        if let Some(ref controller) = self.adaptive_controller {
+            controller.active()
+        } else {
+            // For fixed semaphore, we don't track this
+            0
         }
     }
 

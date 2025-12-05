@@ -537,7 +537,6 @@ impl TorrentStateLive {
             Some(wm) => wm.clone(),
             None => return Ok(()),
         };
-
         info!(
             id = self.shared.id,
             "starting webseed downloader with {} sources",
@@ -547,7 +546,6 @@ impl TorrentStateLive {
         loop {
             // Wait a bit between iterations
             tokio::time::sleep(Duration::from_millis(500)).await;
-
             if self.cancellation_token.is_cancelled() {
                 debug!("webseed downloader cancelled");
                 return Ok(());
