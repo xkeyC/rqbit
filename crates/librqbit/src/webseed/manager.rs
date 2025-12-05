@@ -523,9 +523,12 @@ impl WebSeedManager {
                                 "adaptive concurrency decreased due to error"
                             );
                         }
+                        // When adaptive concurrency is enabled, don't mark webseed error on every failure
+                        // The adaptive controller handles error counting with debounce
+                    } else {
+                        // No adaptive controller, use legacy per-webseed error counting
+                        self.mark_webseed_error(&webseed.url);
                     }
-                    
-                    self.mark_webseed_error(&webseed.url);
                 }
             }
         }
