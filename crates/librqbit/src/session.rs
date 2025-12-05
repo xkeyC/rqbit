@@ -147,6 +147,9 @@ pub struct Session {
     pub(crate) stats: Arc<SessionStats>,
     root_span: Option<tracing::Span>,
 
+    // WebSeed configuration
+    pub(crate) webseed_config: crate::webseed::WebSeedConfig,
+
     // Feature flags
     #[cfg(feature = "disable-upload")]
     _disable_upload: bool,
@@ -452,6 +455,9 @@ pub struct SessionOptions {
 
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
+
+    /// WebSeed configuration for HTTP seeding (BEP-19).
+    pub webseed_config: Option<crate::webseed::WebSeedConfig>,
 }
 
 fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
@@ -742,6 +748,7 @@ impl Session {
                 blocklist,
                 allowlist,
                 lsd,
+                webseed_config: opts.webseed_config.unwrap_or_default(),
             });
 
             if let Some(mut disk_write_rx) = disk_write_rx {

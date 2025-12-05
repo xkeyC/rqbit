@@ -184,7 +184,7 @@ pub struct TorrentStateLive {
 
     per_piece_locks: Vec<RwLock<()>>,
 
-    stats: AtomicStats,
+    stats: Arc<AtomicStats>,
     lengths: Lengths,
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
@@ -233,6 +233,12 @@ impl TorrentStateLive {
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
+
+        // Create stats early so we can share it with webseed manager
+        let stats = Arc::new(AtomicStats {
+            have_bytes: AtomicU64::new(have_bytes),
+            ..Default::default()
+        });
 
         // TODO: make it configurable
         let file_priorities = {
@@ -286,6 +292,15 @@ impl TorrentStateLive {
             let is_multi_file = paused.metadata.file_infos.len() > 1;
             let torrent_name = paused.metadata.info.name().map(|s| s.to_string());
 
+            // Create callback for real-time webseed speed tracking
+            let stats_for_callback = stats.clone();
+            let session_stats_for_callback = session_stats.clone();
+            let on_bytes_received: crate::webseed::BytesReceivedCallback = Arc::new(move |bytes| {
+                use std::sync::atomic::Ordering;
+                stats_for_callback.fetched_bytes.fetch_add(bytes, Ordering::Relaxed);
+                session_stats_for_callback.counters.fetched_bytes.fetch_add(bytes, Ordering::Relaxed);
+            });
+
             Some(Arc::new(crate::webseed::WebSeedManager::new(
                 paused.metadata.webseed_urls.clone(),
                 session.reqwest_client.clone(),
@@ -294,8 +309,9 @@ impl TorrentStateLive {
                 torrent_name,
                 file_infos,
                 is_multi_file,
-                crate::webseed::WebSeedConfig::default(),
+                session.webseed_config.clone(),
                 cancellation_token.clone(),
+                Some(on_bytes_received),
             )))
         } else {
             None
@@ -319,10 +335,7 @@ impl TorrentStateLive {
                 unflushed_bitv_bytes: 0,
             }),
             files: paused.files,
-            stats: AtomicStats {
-                have_bytes: AtomicU64::new(have_bytes),
-                ..Default::default()
-            },
+            stats,
             lengths,
             peer_semaphore: Arc::new(Semaphore::new(128)),
             new_pieces_notify: Notify::new(),
@@ -341,7 +354,6 @@ impl TorrentStateLive {
             ratelimits,
             webseed_manager,
         });
-
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "speed_estimator_updater"),
             format!("[{}]speed_estimator_updater", state.shared.id),
@@ -608,8 +620,7 @@ impl TorrentStateLive {
 
                     match result {
                         Ok(crate::webseed::WebSeedDownloadResult::Success { piece_index, data }) => {
-                            // Update fetched_bytes immediately for real-time speed calculation
-                            state.on_webseed_data_received(data.len() as u64);
+                            // Note: fetched_bytes is already updated via streaming callback during download
 
                             // Write the piece to disk
                             if let Err(e) = state.write_webseed_piece(piece_index, data).await {
@@ -726,7 +737,7 @@ impl TorrentStateLive {
             chunks.mark_piece_downloaded(piece_index);
         }
 
-        // Update stats (fetched_bytes is already updated in on_webseed_data_received for real-time speed)
+        // Update stats (fetched_bytes is already updated via streaming callback for real-time speed)
         self.stats
             .downloaded_and_checked_bytes
             .fetch_add(piece_len, Ordering::Release);
@@ -752,20 +763,6 @@ impl TorrentStateLive {
         );
 
         Ok(())
-    }
-
-    /// Update stats when webseed data is received (for real-time speed calculation).
-    fn on_webseed_data_received(&self, bytes: u64) {
-        use std::sync::atomic::Ordering;
-
-        // Update fetched_bytes for speed calculation
-        self.stats.fetched_bytes.fetch_add(bytes, Ordering::Relaxed);
-
-        // Update session-level stats for global speed calculation
-        self.session_stats
-            .counters
-            .fetched_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     async fn task_manage_incoming_peer(

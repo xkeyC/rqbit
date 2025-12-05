@@ -6,13 +6,14 @@ use std::ops::Range;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use tracing::{debug, trace, warn};
 use url::Url;
 
 use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
-use super::{WebSeedError, WebSeedFileInfo, WebSeedUrl};
+use super::{BytesReceivedCallback, WebSeedError, WebSeedFileInfo, WebSeedUrl};
 
 /// HTTP client for WebSeed downloads.
 #[derive(Clone)]
@@ -64,13 +65,15 @@ impl WebSeedClient {
         Ok(url)
     }
 
-    /// Download a byte range from a WebSeed URL.
+    /// Download a byte range from a WebSeed URL with streaming and progress callback.
     ///
     /// Uses HTTP Range header to request specific bytes.
+    /// Calls the progress callback with bytes received during download for real-time stats.
     pub async fn download_range(
         &self,
         url: &Url,
         range: Range<u64>,
+        on_bytes_received: Option<&BytesReceivedCallback>,
     ) -> Result<Bytes, WebSeedError> {
         let range_header = format!("bytes={}-{}", range.start, range.end - 1);
 
@@ -92,9 +95,9 @@ impl WebSeedClient {
 
         // Check for success - either 200 (full content) or 206 (partial content)
         if status == StatusCode::PARTIAL_CONTENT {
-            // Server supports byte ranges
-            let bytes = response.bytes().await?;
+            // Server supports byte ranges - use streaming to report progress
             let expected_len = (range.end - range.start) as usize;
+            let bytes = self.stream_response(response, on_bytes_received).await?;
 
             if bytes.len() != expected_len {
                 warn!(
@@ -109,7 +112,7 @@ impl WebSeedClient {
         } else if status == StatusCode::OK {
             // Server doesn't support byte ranges, returned full content
             // We need to extract the relevant portion
-            let bytes = response.bytes().await?;
+            let bytes = self.stream_response(response, on_bytes_received).await?;
             let start = range.start as usize;
             let end = range.end as usize;
 
@@ -132,6 +135,30 @@ impl WebSeedClient {
         }
     }
 
+    /// Stream a response body and call the progress callback for each chunk.
+    async fn stream_response(
+        &self,
+        response: reqwest::Response,
+        on_bytes_received: Option<&BytesReceivedCallback>,
+    ) -> Result<Bytes, WebSeedError> {
+        let mut stream = response.bytes_stream();
+        let mut buffer = BytesMut::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
+            let chunk_len = chunk.len() as u64;
+
+            // Report bytes received for real-time speed calculation
+            if let Some(callback) = on_bytes_received {
+                callback(chunk_len);
+            }
+
+            buffer.extend_from_slice(&chunk);
+        }
+
+        Ok(buffer.freeze())
+    }
+
     /// Download a complete piece from a WebSeed.
     ///
     /// For single-file torrents, this downloads a byte range directly.
@@ -145,6 +172,7 @@ impl WebSeedClient {
         torrent_name: Option<&str>,
         file_infos: &[WebSeedFileInfo],
         is_multi_file: bool,
+        on_bytes_received: Option<&BytesReceivedCallback>,
     ) -> Result<Bytes, WebSeedError> {
         if webseed_url.disabled {
             return Err(WebSeedError::Disabled);
@@ -162,7 +190,7 @@ impl WebSeedClient {
                 is_multi_file,
             )?;
 
-            self.download_range(&url, piece_offset..piece_offset + piece_length)
+            self.download_range(&url, piece_offset..piece_offset + piece_length, on_bytes_received)
                 .await
         } else {
             // Multi-file torrent - piece may span multiple files
@@ -172,6 +200,7 @@ impl WebSeedClient {
                 piece_length,
                 torrent_name,
                 file_infos,
+                on_bytes_received,
             )
             .await
         }
@@ -188,6 +217,7 @@ impl WebSeedClient {
         piece_length: u64,
         torrent_name: Option<&str>,
         file_infos: &[WebSeedFileInfo],
+        on_bytes_received: Option<&BytesReceivedCallback>,
     ) -> Result<Bytes, WebSeedError> {
         let piece_end = piece_offset + piece_length;
         let mut result = BytesMut::with_capacity(piece_length as usize);
@@ -227,7 +257,7 @@ impl WebSeedClient {
 
             // Download the range from this file
             let bytes = self
-                .download_range(&url, file_range_start..file_range_end)
+                .download_range(&url, file_range_start..file_range_end, on_bytes_received)
                 .await?;
 
             result.extend_from_slice(&bytes);

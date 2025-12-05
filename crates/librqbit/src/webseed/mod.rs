@@ -13,8 +13,13 @@ pub use client::WebSeedClient;
 pub use manager::{WebSeedManager, WebSeedStatus};
 
 use librqbit_core::lengths::ValidPieceIndex;
+use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
+
+/// Callback type for reporting bytes downloaded from webseed in real-time.
+/// This is called during the download process, not after completion.
+pub type BytesReceivedCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// A WebSeed source URL.
 #[derive(Debug, Clone)]

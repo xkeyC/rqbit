@@ -101,6 +101,7 @@ pub use torrent_state::{
     TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
+pub use webseed::WebSeedConfig;
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
