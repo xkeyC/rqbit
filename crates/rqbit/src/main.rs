@@ -289,12 +289,12 @@ struct Opts {
     #[arg(long = "webseed-timeout", default_value = "30", env = "RQBIT_WEBSEED_TIMEOUT")]
     webseed_timeout_secs: u64,
 
-    /// Maximum consecutive errors before disabling a webseed source (default: 10)
-    #[arg(long = "webseed-max-errors", default_value = "10", env = "RQBIT_WEBSEED_MAX_ERRORS")]
+    /// Maximum consecutive errors before disabling a webseed source (default: 5)
+    #[arg(long = "webseed-max-errors", default_value = "5", env = "RQBIT_WEBSEED_MAX_ERRORS")]
     webseed_max_errors: u32,
 
-    /// Cooldown period in minutes before retrying a disabled webseed (default: 30)
-    #[arg(long = "webseed-cooldown-mins", default_value = "30", env = "RQBIT_WEBSEED_COOLDOWN_MINS")]
+    /// Cooldown period in minutes before retrying a disabled webseed (default: 10)
+    #[arg(long = "webseed-cooldown-mins", default_value = "10", env = "RQBIT_WEBSEED_COOLDOWN_MINS")]
     webseed_cooldown_mins: u64,
 }
 

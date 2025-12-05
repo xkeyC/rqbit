@@ -261,8 +261,10 @@ impl WebSeedManager {
         let max_errors = self.config.max_errors_before_disable;
         let mut webseeds = self.webseeds.write();
         if let Some(ws) = webseeds.iter_mut().find(|ws| &ws.url == url) {
+            let was_disabled = ws.disabled;
             ws.mark_error(max_errors);
-            if ws.disabled {
+            // Only log when transitioning from enabled to disabled
+            if ws.disabled && !was_disabled {
                 warn!(
                     url = %url,
                     error_count = ws.error_count,
