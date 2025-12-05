@@ -608,6 +608,9 @@ impl TorrentStateLive {
 
                     match result {
                         Ok(crate::webseed::WebSeedDownloadResult::Success { piece_index, data }) => {
+                            // Update fetched_bytes immediately for real-time speed calculation
+                            state.on_webseed_data_received(data.len() as u64);
+
                             // Write the piece to disk
                             if let Err(e) = state.write_webseed_piece(piece_index, data).await {
                                 warn!(
@@ -723,10 +726,7 @@ impl TorrentStateLive {
             chunks.mark_piece_downloaded(piece_index);
         }
 
-        // Update stats - include fetched_bytes for speed calculation
-        self.stats
-            .fetched_bytes
-            .fetch_add(piece_len, Ordering::Relaxed);
+        // Update stats (fetched_bytes is already updated in on_webseed_data_received for real-time speed)
         self.stats
             .downloaded_and_checked_bytes
             .fetch_add(piece_len, Ordering::Release);
@@ -734,12 +734,6 @@ impl TorrentStateLive {
             .downloaded_and_checked_pieces
             .fetch_add(1, Ordering::Relaxed);
         self.stats.have_bytes.fetch_add(piece_len, Ordering::Relaxed);
-
-        // Update session-level stats for global speed calculation
-        self.session_stats
-            .counters
-            .fetched_bytes
-            .fetch_add(piece_len, Ordering::Relaxed);
 
         // Notify other components
         self.transmit_haves(piece_index);
@@ -758,6 +752,20 @@ impl TorrentStateLive {
         );
 
         Ok(())
+    }
+
+    /// Update stats when webseed data is received (for real-time speed calculation).
+    fn on_webseed_data_received(&self, bytes: u64) {
+        use std::sync::atomic::Ordering;
+
+        // Update fetched_bytes for speed calculation
+        self.stats.fetched_bytes.fetch_add(bytes, Ordering::Relaxed);
+
+        // Update session-level stats for global speed calculation
+        self.session_stats
+            .counters
+            .fetched_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     async fn task_manage_incoming_peer(
