@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::{
     AddTorrent, CreateTorrentOptions, Session, create_torrent,
+    spawn_utils::BlockingSpawner,
     tests::test_util::{TestPeerMetadata, setup_test_logging},
 };
 
@@ -22,6 +23,7 @@ async fn e2e_stream() -> anyhow::Result<()> {
             piece_length: Some(1024),
             ..Default::default()
         },
+        &BlockingSpawner::new(1),
     )
     .await?;
 
@@ -102,7 +104,7 @@ async fn e2e_stream() -> anyhow::Result<()> {
 
     info!("client torrent initialized, starting stream");
 
-    let mut stream = client_handle.stream(0)?;
+    let mut stream = client_handle.stream(0).await?;
     let mut buf = Vec::<u8>::with_capacity(8192);
     stream.read_to_end(&mut buf).await?;
 
