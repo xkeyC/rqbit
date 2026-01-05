@@ -87,7 +87,7 @@ impl JsonSessionPersistenceStore {
     async fn flush(&self) -> anyhow::Result<()> {
         // we don't need the write lock technically, but we need to stop concurrent modifications
         let db_content = self.db_content.write().await;
-        let tmp_filename = format!("{}.tmp", self.db_filename.to_str().unwrap());
+        let tmp_filename = self.db_filename.with_extension("json.tmp");
         let mut tmp = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -104,11 +104,30 @@ impl JsonSessionPersistenceStore {
         tmp.write_all(&buf)
             .await
             .with_context(|| format!("error writing {tmp_filename:?}"))?;
+        // Ensure the file is fully written and synced before rename
+        tmp.sync_all().await.with_context(|| format!("error syncing {tmp_filename:?}"))?;
+        drop(tmp);
         trace!(?tmp_filename, "wrote to temp file");
 
-        tokio::fs::rename(&tmp_filename, &self.db_filename)
-            .await
-            .context("error renaming persistence file")?;
+        // Try atomic rename first, fall back to copy+delete if it fails (e.g., cross-device on Windows)
+        if let Err(rename_err) = tokio::fs::rename(&tmp_filename, &self.db_filename).await {
+            // Check if it's a cross-device error (Windows error 17, Unix EXDEV)
+            let is_cross_device = rename_err.raw_os_error() == Some(17) || // Windows ERROR_NOT_SAME_DEVICE
+                                  rename_err.raw_os_error() == Some(18);   // Unix EXDEV
+            
+            if is_cross_device {
+                trace!(?tmp_filename, ?rename_err, "rename failed with cross-device error, falling back to copy+delete");
+                // Fall back to copy + delete
+                tokio::fs::copy(&tmp_filename, &self.db_filename)
+                    .await
+                    .with_context(|| format!("error copying {tmp_filename:?} to {:?}", self.db_filename))?;
+                // Try to remove the temp file, but don't fail if it doesn't work
+                let _ = tokio::fs::remove_file(&tmp_filename).await;
+            } else {
+                return Err(rename_err).context("error renaming persistence file");
+            }
+        }
+        
         trace!(filename=?self.db_filename, "wrote persistence");
         Ok(())
     }
@@ -217,20 +236,40 @@ impl BitVFactory for JsonSessionPersistenceStore {
     ) -> anyhow::Result<Box<dyn BitV>> {
         let h = self.to_hash(id).await?;
         let filename = self.bitv_filename(&h);
-        let tmp_filename = format!("{}.tmp", filename.to_str().context("bug")?);
+        let tmp_filename = filename.with_extension("bitv.tmp");
         let mut dst = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&tmp_filename)
             .await
-            .with_context(|| format!("error opening {filename:?}"))?;
+            .with_context(|| format!("error opening {tmp_filename:?}"))?;
         tokio::io::copy(&mut b.as_raw_slice(), &mut dst)
             .await
             .context("error writing bitslice to {filename:?}")?;
-        tokio::fs::rename(&tmp_filename, &filename)
-            .await
-            .with_context(|| format!("error renaming {tmp_filename:?} to {filename:?}"))?;
+        // Ensure the file is fully written and synced before rename
+        dst.sync_all().await.with_context(|| format!("error syncing {tmp_filename:?}"))?;
+        drop(dst);
+        
+        // Try atomic rename first, fall back to copy+delete if it fails (e.g., cross-device on Windows)
+        if let Err(rename_err) = tokio::fs::rename(&tmp_filename, &filename).await {
+            // Check if it's a cross-device error (Windows error 17, Unix EXDEV)
+            let is_cross_device = rename_err.raw_os_error() == Some(17) || // Windows ERROR_NOT_SAME_DEVICE
+                                  rename_err.raw_os_error() == Some(18);   // Unix EXDEV
+            
+            if is_cross_device {
+                trace!(?tmp_filename, ?rename_err, "rename failed with cross-device error, falling back to copy+delete");
+                // Fall back to copy + delete
+                tokio::fs::copy(&tmp_filename, &filename)
+                    .await
+                    .with_context(|| format!("error copying {tmp_filename:?} to {filename:?}"))?;
+                // Try to remove the temp file, but don't fail if it doesn't work
+                let _ = tokio::fs::remove_file(&tmp_filename).await;
+            } else {
+                return Err(rename_err).with_context(|| format!("error renaming {tmp_filename:?} to {filename:?}"));
+            }
+        }
+        
         trace!(?filename, "stored initial check bitfield");
         Ok(DiskBackedBitV::new(filename.clone(), self.spawner.clone())
             .await
