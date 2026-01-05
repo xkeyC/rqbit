@@ -629,6 +629,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             disable_cooldown_secs: opts.webseed_cooldown_mins * 60,
             ..Default::default()
         }),
+        runtime_worker_threads: Some(opts.max_blocking_threads as usize),
     };
 
     #[allow(clippy::needless_update)]
