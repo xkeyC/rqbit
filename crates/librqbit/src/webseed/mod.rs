@@ -158,6 +158,9 @@ pub struct WebSeedConfig {
     pub adaptive_increase_threshold: u32,
     /// Number of consecutive errors to decrease concurrency by half.
     pub adaptive_decrease_threshold: u32,
+    /// Custom HTTP User-Agent header for WebSeed requests.
+    /// If not set, the default reqwest User-Agent will be used.
+    pub user_agent: Option<String>,
 }
 
 impl Default for WebSeedConfig {
@@ -173,6 +176,7 @@ impl Default for WebSeedConfig {
             adaptive_concurrency: true,
             adaptive_increase_threshold: 5,
             adaptive_decrease_threshold: 2,
+            user_agent: None,
         }
     }
 }

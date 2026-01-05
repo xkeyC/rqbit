@@ -465,7 +465,7 @@ impl WebSeedManager {
 
         Self {
             webseeds: RwLock::new(webseed_urls),
-            client: WebSeedClient::new(reqwest_client, config.request_timeout_secs),
+            client: WebSeedClient::new(reqwest_client, config.request_timeout_secs, config.user_agent.clone()),
             lengths,
             piece_hashes: Arc::new(piece_hashes),
             torrent_name,

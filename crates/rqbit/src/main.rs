@@ -296,6 +296,10 @@ struct Opts {
     /// Cooldown period in minutes before retrying a disabled webseed (default: 10)
     #[arg(long = "webseed-cooldown-mins", default_value = "10", env = "RQBIT_WEBSEED_COOLDOWN_MINS")]
     webseed_cooldown_mins: u64,
+
+    /// Custom HTTP User-Agent header for WebSeed requests
+    #[arg(long = "webseed-user-agent", env = "RQBIT_WEBSEED_USER_AGENT")]
+    webseed_user_agent: Option<String>,
 }
 
 #[derive(Parser)]
@@ -627,6 +631,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             request_timeout_secs: opts.webseed_timeout_secs,
             max_errors_before_disable: opts.webseed_max_errors,
             disable_cooldown_secs: opts.webseed_cooldown_mins * 60,
+            user_agent: opts.webseed_user_agent.clone(),
             ..Default::default()
         }),
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),

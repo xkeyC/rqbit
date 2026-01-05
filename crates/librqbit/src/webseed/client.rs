@@ -21,14 +21,16 @@ use super::{BytesReceivedCallback, RateLimitCallback, WebSeedError, WebSeedFileI
 pub struct WebSeedClient {
     client: Client,
     timeout: Duration,
+    user_agent: Option<String>,
 }
 
 impl WebSeedClient {
     /// Create a new WebSeed client with the given reqwest client.
-    pub fn new(client: Client, timeout_secs: u64) -> Self {
+    pub fn new(client: Client, timeout_secs: u64, user_agent: Option<String>) -> Self {
         Self {
             client,
             timeout: Duration::from_secs(timeout_secs),
+            user_agent,
         }
     }
 
@@ -85,13 +87,17 @@ impl WebSeedClient {
             "downloading byte range from webseed"
         );
 
-        let response = self
+        let mut request = self
             .client
             .get(url.clone())
             .header("Range", &range_header)
-            .timeout(self.timeout)
-            .send()
-            .await?;
+            .timeout(self.timeout);
+
+        if let Some(ua) = &self.user_agent {
+            request = request.header("User-Agent", ua);
+        }
+
+        let response = request.send().await?;
 
         let status = response.status();
 
@@ -296,12 +302,16 @@ impl WebSeedClient {
 
     /// Check if a WebSeed URL is valid and responding.
     pub async fn probe(&self, url: &Url) -> Result<(), WebSeedError> {
-        let response = self
+        let mut request = self
             .client
             .head(url.clone())
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?;
+            .timeout(Duration::from_secs(10));
+
+        if let Some(ua) = &self.user_agent {
+            request = request.header("User-Agent", ua);
+        }
+
+        let response = request.send().await?;
 
         if response.status().is_success() {
             Ok(())
