@@ -78,6 +78,7 @@ mod type_aliases;
 #[cfg(all(feature = "http-api", feature = "upnp-serve-adapter"))]
 pub mod upnp_server_adapter;
 mod vectored_traits;
+pub mod webseed;
 #[cfg(feature = "watch")]
 pub mod watch;
 
@@ -96,10 +97,11 @@ pub use session::{
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
-    ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState,
+    ManagedTorrent, ManagedTorrentOptions, ManagedTorrentShared, ManagedTorrentState,
+    TorrentMetadata, TorrentStats, TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
+pub use webseed::WebSeedConfig;
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;

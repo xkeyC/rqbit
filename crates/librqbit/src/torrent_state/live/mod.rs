@@ -184,7 +184,7 @@ pub struct TorrentStateLive {
 
     per_piece_locks: Vec<RwLock<()>>,
 
-    stats: AtomicStats,
+    stats: Arc<AtomicStats>,
     lengths: Lengths,
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
@@ -209,7 +209,10 @@ pub struct TorrentStateLive {
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
         ChunkInfo,
     )>,
-    ratelimits: Limits,
+    ratelimits: Arc<Limits>,
+
+    /// BEP-19: WebSeed manager for HTTP seeding.
+    webseed_manager: Option<Arc<crate::webseed::WebSeedManager>>,
 }
 
 impl TorrentStateLive {
@@ -231,6 +234,12 @@ impl TorrentStateLive {
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
 
+        // Create stats early so we can share it with webseed manager
+        let stats = Arc::new(AtomicStats {
+            have_bytes: AtomicU64::new(have_bytes),
+            ..Default::default()
+        });
+
         // TODO: make it configurable
         let file_priorities = {
             let mut pri = (0..paused.metadata.file_infos.len()).collect::<Vec<usize>>();
@@ -251,7 +260,79 @@ impl TorrentStateLive {
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>();
-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
+        let ratelimits = Arc::new(Limits::new(paused.shared.options.ratelimits));
+
+        // Initialize WebSeed manager if there are webseed URLs
+        let webseed_manager = if !paused.metadata.webseed_urls.is_empty() {
+            let piece_hashes: Vec<Id20> = paused
+                .metadata
+                .info
+                .info()
+                .pieces
+                .as_ref()
+                .chunks_exact(20)
+                .map(|chunk| {
+                    let mut arr = [0u8; 20];
+                    arr.copy_from_slice(chunk);
+                    Id20::new(arr)
+                })
+                .collect();
+            let file_infos: Vec<crate::webseed::WebSeedFileInfo> = paused
+                .metadata
+                .file_infos
+                .iter()
+                .map(|fi| crate::webseed::WebSeedFileInfo {
+                    path: fi.relative_filename.to_string_lossy().to_string(),
+                    offset: fi.offset_in_torrent,
+                    length: fi.len,
+                })
+                .collect();
+
+            let is_multi_file = paused.metadata.file_infos.len() > 1;
+            let torrent_name = paused.metadata.info.name().map(|s| s.to_string());
+
+            // Create callback for real-time webseed speed tracking
+            let stats_for_callback = stats.clone();
+            let session_stats_for_callback = session_stats.clone();
+            let on_bytes_received: crate::webseed::BytesReceivedCallback = Arc::new(move |bytes| {
+                use std::sync::atomic::Ordering;
+                stats_for_callback.fetched_bytes.fetch_add(bytes, Ordering::Relaxed);
+                session_stats_for_callback.counters.fetched_bytes.fetch_add(bytes, Ordering::Relaxed);
+            });
+
+            // Create rate limiter callback that applies both torrent and session limits
+            let torrent_ratelimits = ratelimits.clone();
+            let session_weak = Arc::downgrade(&session);
+            let rate_limiter: crate::webseed::RateLimitCallback = Arc::new(move |len| {
+                let torrent_ratelimits = torrent_ratelimits.clone();
+                let session_weak = session_weak.clone();
+                Box::pin(async move {
+                    // Apply torrent-level rate limit
+                    torrent_ratelimits.prepare_for_download(len).await?;
+                    // Apply session-level rate limit
+                    if let Some(session) = session_weak.upgrade() {
+                        session.ratelimits.prepare_for_download(len).await?;
+                    }
+                    Ok(())
+                })
+            });
+
+            Some(Arc::new(crate::webseed::WebSeedManager::new(
+                paused.metadata.webseed_urls.clone(),
+                session.reqwest_client.clone(),
+                lengths,
+                piece_hashes,
+                torrent_name,
+                file_infos,
+                is_multi_file,
+                session.webseed_config.clone(),
+                cancellation_token.clone(),
+                Some(on_bytes_received),
+                Some(rate_limiter),
+            )))
+        } else {
+            None
+        };
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -271,10 +352,7 @@ impl TorrentStateLive {
                 unflushed_bitv_bytes: 0,
             }),
             files: paused.files,
-            stats: AtomicStats {
-                have_bytes: AtomicU64::new(have_bytes),
-                ..Default::default()
-            },
+            stats,
             lengths,
             peer_semaphore: Arc::new(Semaphore::new(128)),
             new_pieces_notify: Notify::new(),
@@ -291,8 +369,8 @@ impl TorrentStateLive {
                 .collect(),
             ratelimit_upload_tx,
             ratelimits,
+            webseed_manager,
         });
-
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "speed_estimator_updater"),
             format!("[{}]speed_estimator_updater", state.shared.id),
@@ -334,6 +412,16 @@ impl TorrentStateLive {
             format!("[{}]upload_scheduler", state.shared.id),
             state.clone().task_upload_scheduler(ratelimit_upload_rx),
         );
+
+        // Start WebSeed downloader task if webseeds are available
+        if state.webseed_manager.is_some() {
+            state.spawn(
+                debug_span!(parent: state.shared.span.clone(), "webseed_downloader"),
+                format!("[{}]webseed_downloader", state.shared.id),
+                state.clone().task_webseed_downloader(),
+            );
+        }
+
         Ok(state)
     }
 
@@ -441,6 +529,257 @@ impl TorrentStateLive {
             }
             let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
         }
+        Ok(())
+    }
+
+    /// BEP-19: WebSeed downloader task.
+    ///
+    /// This task monitors for gaps in the download and uses WebSeeds to fill them.
+    async fn task_webseed_downloader(self: Arc<Self>) -> crate::Result<()> {
+        let webseed_manager = match &self.webseed_manager {
+            Some(wm) => wm.clone(),
+            None => return Ok(()),
+        };
+        info!(
+            id = self.shared.id,
+            "starting webseed downloader with {} sources",
+            webseed_manager.available_webseed_count()
+        );
+
+        loop {
+            // Wait a bit between iterations
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if self.cancellation_token.is_cancelled() {
+                debug!("webseed downloader cancelled");
+                return Ok(());
+            }
+
+            // Check if we're finished
+            if self.is_finished() {
+                debug!("torrent finished, stopping webseed downloader");
+                return Ok(());
+            }
+
+            // Check if any webseeds are available
+            if !webseed_manager.has_webseeds() {
+                debug!("no webseeds available, stopping webseed downloader");
+                return Ok(());
+            }
+
+            // Find pieces that need downloading and aren't being handled by peers
+            let piece_to_download = {
+                let g = self.lock_read("webseed_find_piece");
+                let chunks = match g.get_chunks() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Find a piece that:
+                // 1. We need (not have)
+                // 2. Is not inflight from peers
+                // 3. Is not being downloaded by webseed
+                let mut candidate: Option<ValidPieceIndex> = None;
+                for piece_idx in 0..self.lengths.total_pieces() {
+                    let piece = match self.lengths.validate_piece_index(piece_idx) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    if chunks.is_piece_have(piece) {
+                        continue;
+                    }
+
+                    if g.inflight_pieces.contains_key(&piece) {
+                        continue;
+                    }
+
+                    if webseed_manager.is_in_flight(piece) {
+                        continue;
+                    }
+
+                    candidate = Some(piece);
+                    break;
+                }
+                candidate
+            };
+
+            let piece_index = match piece_to_download {
+                Some(p) => p,
+                None => {
+                    // No pieces need webseed download, wait a bit
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            // Mark the piece as being downloaded by webseed
+            if !webseed_manager.mark_in_flight(piece_index) {
+                continue;
+            }
+
+            // Spawn a task to download this piece
+            let state = self.clone();
+            let wm = webseed_manager.clone();
+
+            self.spawn(
+                debug_span!(
+                    parent: self.shared.span.clone(),
+                    "webseed_piece_download",
+                    piece = piece_index.get()
+                ),
+                format!(
+                    "[{}][piece={}]webseed_piece_download",
+                    self.shared.id,
+                    piece_index.get()
+                ),
+                async move {
+                    let result = wm.download_piece(piece_index).await;
+                    wm.unmark_in_flight(piece_index);
+
+                    match result {
+                        Ok(crate::webseed::WebSeedDownloadResult::Success { piece_index, data }) => {
+                            // Note: fetched_bytes is already updated via streaming callback during download
+
+                            // Write the piece to disk
+                            if let Err(e) = state.write_webseed_piece(piece_index, data).await {
+                                warn!(
+                                    piece = piece_index.get(),
+                                    error = %e,
+                                    "failed to write webseed piece"
+                                );
+                            }
+                        }
+                        Ok(crate::webseed::WebSeedDownloadResult::Error { piece_index, error }) => {
+                            debug!(
+                                piece = piece_index.get(),
+                                error = %error,
+                                "webseed piece download error"
+                            );
+                        }
+                        Ok(crate::webseed::WebSeedDownloadResult::NotAvailable { piece_index }) => {
+                            trace!(
+                                piece = piece_index.get(),
+                                "piece not available from webseed"
+                            );
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "webseed download failed");
+                        }
+                    }
+                    Ok(())
+                },
+            );
+        }
+    }
+
+    /// Write a piece downloaded from a WebSeed to disk.
+    async fn write_webseed_piece(
+        self: &Arc<Self>,
+        piece_index: ValidPieceIndex,
+        data: bytes::Bytes,
+    ) -> anyhow::Result<()> {
+        let piece_length = self.lengths.piece_length(piece_index) as usize;
+        if data.len() != piece_length {
+            bail!(
+                "webseed piece size mismatch: expected {}, got {}",
+                piece_length,
+                data.len()
+            );
+        }
+
+        // Write the piece data to disk
+        let piece_offset = self.lengths.piece_offset(piece_index);
+
+        // Write the data to the appropriate files
+        let mut data_written = 0usize;
+        for (file_id, file_info) in self.metadata.file_infos.iter().enumerate() {
+            let file_start = file_info.offset_in_torrent;
+            let file_end = file_start + file_info.len;
+
+            if piece_offset >= file_end {
+                continue;
+            }
+
+            let piece_end = piece_offset + piece_length as u64;
+            if piece_end <= file_start {
+                continue;
+            }
+
+            // Calculate the portion of this piece that goes into this file
+            let write_start = piece_offset.max(file_start);
+            let write_end = piece_end.min(file_end);
+            let data_offset = (write_start - piece_offset) as usize;
+            let file_offset = write_start - file_start;
+            let write_len = (write_end - write_start) as usize;
+
+            if file_info.attrs.padding {
+                data_written += write_len;
+                continue;
+            }
+
+            self.files.pwrite_all(
+                file_id,
+                file_offset,
+                &data[data_offset..data_offset + write_len],
+            )?;
+            data_written += write_len;
+        }
+
+        if data_written != piece_length {
+            warn!(
+                piece = piece_index.get(),
+                expected = piece_length,
+                written = data_written,
+                "webseed piece not fully written"
+            );
+        }
+
+        // Mark piece as complete
+        self.on_webseed_piece_completed(piece_index)?;
+
+        Ok(())
+    }
+
+    /// Handle completion of a piece downloaded from WebSeed.
+    fn on_webseed_piece_completed(&self, piece_index: ValidPieceIndex) -> crate::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let piece_len = self.lengths.piece_length(piece_index) as u64;
+
+        // Update chunk tracker - just mark the piece as downloaded
+        {
+            let mut g = self.lock_write("webseed_piece_completed");
+            let chunks = g.get_chunks_mut()?;
+
+            // Mark piece as have
+            chunks.mark_piece_downloaded(piece_index);
+        }
+
+        // Update stats (fetched_bytes is already updated via streaming callback for real-time speed)
+        self.stats
+            .downloaded_and_checked_bytes
+            .fetch_add(piece_len, Ordering::Release);
+        self.stats
+            .downloaded_and_checked_pieces
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats.have_bytes.fetch_add(piece_len, Ordering::Relaxed);
+
+        // Notify other components
+        self.transmit_haves(piece_index);
+        self.new_pieces_notify.notify_waiters();
+
+        // Check if finished
+        if self.is_finished() {
+            self.finished_notify.notify_waiters();
+            info!(id = self.shared.id, "torrent download complete (via webseed)");
+        }
+
+        debug!(
+            id = self.shared.id,
+            piece = piece_index.get(),
+            "webseed piece completed"
+        );
+
         Ok(())
     }
 

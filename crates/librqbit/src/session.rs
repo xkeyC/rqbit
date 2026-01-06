@@ -118,7 +118,7 @@ pub struct Session {
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
-    reqwest_client: reqwest::Client,
+    pub(crate) reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
 
@@ -146,6 +146,9 @@ pub struct Session {
     // Monitoring / tracing / logging
     pub(crate) stats: Arc<SessionStats>,
     root_span: Option<tracing::Span>,
+
+    // WebSeed configuration
+    pub(crate) webseed_config: crate::webseed::WebSeedConfig,
 
     // Feature flags
     #[cfg(feature = "disable-upload")]
@@ -456,6 +459,9 @@ pub struct SessionOptions {
 
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
+
+    /// WebSeed configuration for HTTP seeding (BEP-19).
+    pub webseed_config: Option<crate::webseed::WebSeedConfig>,
 }
 
 fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
@@ -751,6 +757,7 @@ impl Session {
                 blocklist,
                 allowlist,
                 lsd,
+                webseed_config: opts.webseed_config.unwrap_or_default(),
             });
 
             if let Some(mut disk_write_rx) = disk_write_rx {
@@ -1088,12 +1095,40 @@ impl Session {
                         trackers.extend(custom_trackers);
                     }
 
+                    // Parse BEP-19 WebSeed URLs
+                    let webseed_urls: Vec<url::Url> = torrent
+                        .meta
+                        .url_list
+                        .iter_urls()
+                        .filter_map(|url_str| {
+                            match url::Url::parse(&url_str) {
+                                Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {
+                                    debug!(url = %url, "parsed webseed URL");
+                                    Some(url)
+                                }
+                                Ok(url) => {
+                                    debug!(url = %url, "ignoring non-HTTP webseed URL");
+                                    None
+                                }
+                                Err(e) => {
+                                    warn!(url = %url_str, error = %e, "failed to parse webseed URL");
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+
+                    if !webseed_urls.is_empty() {
+                        info!(count = webseed_urls.len(), "found {} webseed URLs", webseed_urls.len());
+                    }
+
                     InternalAddResult {
                         info_hash: torrent.meta.info_hash,
                         metadata: Some(TorrentMetadata::new(
                             torrent.meta.info.data.validate()?,
                             torrent.torrent_bytes,
                             torrent.meta.info.raw_bytes.0,
+                            webseed_urls,
                         )?),
                         trackers: trackers
                             .iter()
@@ -1595,10 +1630,12 @@ impl Session {
                 trace!(?info, "received result from DHT");
                 let info = info.validate()?;
                 Ok(ResolveMagnetResult {
+                    // Magnet links don't have webseed URLs
                     metadata: TorrentMetadata::new(
                         info,
                         torrent_file_from_info_bytes(info_bytes.as_ref(), trackers)?,
                         info_bytes.0,
+                        Vec::new(), // No webseed URLs from magnet link
                     )?,
                     peer_rx: rx,
                     seen_peers: {

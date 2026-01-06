@@ -109,7 +109,7 @@ pub(crate) struct ManagedTorrentLocked {
 }
 
 #[derive(Default)]
-pub(crate) struct ManagedTorrentOptions {
+pub struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
@@ -140,6 +140,8 @@ pub struct TorrentMetadata {
     pub torrent_bytes: Bytes,
     pub info_bytes: Bytes,
     pub file_infos: FileInfos,
+    /// BEP-19: WebSeed URLs for HTTP seeding.
+    pub webseed_urls: Vec<url::Url>,
 }
 
 impl TorrentMetadata {
@@ -147,6 +149,7 @@ impl TorrentMetadata {
         info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
         torrent_bytes: Bytes,
         info_bytes: Bytes,
+        webseed_urls: Vec<url::Url>,
     ) -> anyhow::Result<Self> {
         let file_infos = info
             .iter_file_details_ext()
@@ -166,6 +169,7 @@ impl TorrentMetadata {
             torrent_bytes,
             info_bytes,
             file_infos,
+            webseed_urls,
         })
     }
 
@@ -186,7 +190,7 @@ pub struct ManagedTorrentShared {
     pub trackers: HashSet<url::Url>,
     pub peer_id: Id20,
     pub span: tracing::Span,
-    pub(crate) options: ManagedTorrentOptions,
+    pub options: ManagedTorrentOptions,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,

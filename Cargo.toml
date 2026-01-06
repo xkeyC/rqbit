@@ -14,7 +14,7 @@ members = [
     "crates/upnp",
     "crates/tracker_comms",
     "crates/upnp-serve",
-    "desktop/src-tauri",
+    # "desktop/src-tauri",
 ]
 
 # Everything except desktop

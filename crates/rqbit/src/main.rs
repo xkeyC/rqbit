@@ -15,7 +15,7 @@ use clap_complete::Shell;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions,
     CreateTorrentOptions, ListOnlyResponse, ListenerMode, ListenerOptions, PeerConnectionOptions,
-    Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState, WebSeedConfig,
     http_api::{HttpApi, HttpApiOptions},
     librqbit_spawn,
     limits::LimitsConfig,
@@ -276,6 +276,30 @@ struct Opts {
     /// Disable trackers (for debugging DHT, LSD and --initial-peers)
     #[arg(long = "disable-trackers", env = "RQBIT_TRACKERS_DISABLE")]
     disable_trackers: bool,
+
+    /// Maximum concurrent webseed requests per source (default: 2)
+    #[arg(long = "webseed-max-per-source", default_value = "2", env = "RQBIT_WEBSEED_MAX_PER_SOURCE")]
+    webseed_max_per_source: usize,
+
+    /// Maximum total concurrent webseed requests across all sources (default: 8)
+    #[arg(long = "webseed-max-total", default_value = "8", env = "RQBIT_WEBSEED_MAX_TOTAL")]
+    webseed_max_total: usize,
+
+    /// Webseed request timeout in seconds (default: 30)
+    #[arg(long = "webseed-timeout", default_value = "30", env = "RQBIT_WEBSEED_TIMEOUT")]
+    webseed_timeout_secs: u64,
+
+    /// Maximum consecutive errors before disabling a webseed source (default: 5)
+    #[arg(long = "webseed-max-errors", default_value = "5", env = "RQBIT_WEBSEED_MAX_ERRORS")]
+    webseed_max_errors: u32,
+
+    /// Cooldown period in minutes before retrying a disabled webseed (default: 10)
+    #[arg(long = "webseed-cooldown-mins", default_value = "10", env = "RQBIT_WEBSEED_COOLDOWN_MINS")]
+    webseed_cooldown_mins: u64,
+
+    /// Custom HTTP User-Agent header for WebSeed requests
+    #[arg(long = "webseed-user-agent", env = "RQBIT_WEBSEED_USER_AGENT")]
+    webseed_user_agent: Option<String>,
 }
 
 #[derive(Parser)]
@@ -601,6 +625,15 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         disable_local_service_discovery: opts.disable_local_peer_discovery,
         disable_trackers: opts.disable_trackers,
         trackers,
+        webseed_config: Some(WebSeedConfig {
+            max_concurrent_per_source: opts.webseed_max_per_source,
+            max_total_concurrent: opts.webseed_max_total,
+            request_timeout_secs: opts.webseed_timeout_secs,
+            max_errors_before_disable: opts.webseed_max_errors,
+            disable_cooldown_secs: opts.webseed_cooldown_mins * 60,
+            user_agent: opts.webseed_user_agent.clone(),
+            ..Default::default()
+        }),
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),
     };
 

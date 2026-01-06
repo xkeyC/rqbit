@@ -67,8 +67,126 @@ pub struct TorrentMetaV1<BufType> {
     #[serde(rename = "creation date", skip_serializing_if = "Option::is_none")]
     pub creation_date: Option<usize>,
 
+    /// BEP-19: WebSeed - HTTP/FTP Seeding (GetRight style)
+    /// URL(s) for HTTP/FTP seeding. Can be a single URL string or a list of URLs.
+    #[serde(
+        rename = "url-list",
+        default,
+        skip_serializing_if = "UrlList::is_empty"
+    )]
+    pub url_list: UrlList<BufType>,
+
     #[serde(skip)]
     pub info_hash: Id20,
+}
+
+/// Represents the url-list field which can be either a single string or a list of strings.
+#[derive(Debug, Clone, Default)]
+pub struct UrlList<BufType>(pub Vec<BufType>);
+
+impl<BufType> UrlList<BufType> {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &BufType> {
+        self.0.iter()
+    }
+
+    pub fn into_vec(self) -> Vec<BufType> {
+        self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<BufType: AsRef<[u8]>> UrlList<BufType> {
+    /// Iterate over the URLs as strings.
+    pub fn iter_urls(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        self.0.iter().map(|b| String::from_utf8_lossy(b.as_ref()))
+    }
+}
+
+impl<BufType> Serialize for UrlList<BufType>
+where
+    BufType: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, BufType> Deserialize<'de> for UrlList<BufType>
+where
+    BufType: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct UrlListVisitor<BufType>(std::marker::PhantomData<BufType>);
+
+        impl<'de, BufType> Visitor<'de> for UrlListVisitor<BufType>
+        where
+            BufType: Deserialize<'de>,
+        {
+            type Value = UrlList<BufType>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte string or a list of byte strings")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                // Single URL as bytes - deserialize using the inner deserializer
+                let buf = BufType::deserialize(serde::de::value::BytesDeserializer::new(v))?;
+                Ok(UrlList(vec![buf]))
+            }
+
+            fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                // For borrowed types like ByteBuf<'de>
+                let buf =
+                    BufType::deserialize(serde::de::value::BorrowedBytesDeserializer::new(v))?;
+                Ok(UrlList(vec![buf]))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut urls = Vec::new();
+                while let Some(url) = seq.next_element()? {
+                    urls.push(url);
+                }
+                Ok(UrlList(urls))
+            }
+        }
+
+        deserializer.deserialize_any(UrlListVisitor(std::marker::PhantomData))
+    }
+}
+
+impl<BufType> CloneToOwned for UrlList<BufType>
+where
+    BufType: CloneToOwned,
+{
+    type Target = UrlList<<BufType as CloneToOwned>::Target>;
+
+    fn clone_to_owned(&self, within_buffer: Option<&Bytes>) -> Self::Target {
+        UrlList(self.0.clone_to_owned(within_buffer))
+    }
 }
 
 impl<BufType> TorrentMetaV1<BufType> {
@@ -499,6 +617,7 @@ where
             publisher: self.publisher.clone_to_owned(within_buffer),
             publisher_url: self.publisher_url.clone_to_owned(within_buffer),
             creation_date: self.creation_date,
+            url_list: self.url_list.clone_to_owned(within_buffer),
             info_hash: self.info_hash,
         }
     }
